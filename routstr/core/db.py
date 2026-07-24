@@ -717,14 +717,37 @@ async def complete_routstr_fee_payout(
     return result.rowcount == 1
 
 
-async def balances_for_mint_and_unit(
-    db_session: AsyncSession, mint_url: str, unit: str
-) -> int:
-    query = select(func.sum(ApiKey.balance)).where(
-        ApiKey.refund_mint_url == mint_url, ApiKey.refund_currency == unit
+async def balances_by_mint_and_unit(
+    db_session: AsyncSession, mint_urls: list[str], units: list[str]
+) -> dict[tuple[str, str], int]:
+    """Sum outstanding user balances (msats) grouped by (mint_url, unit).
+
+    One query for every requested mint/unit pair. Pairs with no matching rows
+    are absent from the mapping — callers should default those to 0.
+    """
+    if not mint_urls or not units:
+        return {}
+    query = (
+        select(
+            ApiKey.refund_mint_url,
+            ApiKey.refund_currency,
+            func.sum(ApiKey.balance),
+        )
+        .where(
+            col(ApiKey.refund_mint_url).in_(mint_urls),
+            col(ApiKey.refund_currency).in_(units),
+        )
+        .group_by(col(ApiKey.refund_mint_url), col(ApiKey.refund_currency))
     )
     result = await db_session.exec(query)
-    return result.one() or 0
+    # IN(...) filters out NULL mint_url/currency at the SQL level, so the group
+    # keys are never None at runtime; the guard also narrows the nullable
+    # columns from ``str | None`` to ``str`` for the typed return.
+    return {
+        (mint_url, unit): total or 0
+        for mint_url, unit, total in result.all()
+        if mint_url is not None and unit is not None
+    }
 
 
 async def init_db() -> None:

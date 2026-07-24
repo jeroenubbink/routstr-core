@@ -74,7 +74,7 @@ async def test_periodic_payout_includes_primary_mint_not_in_cashu_mints() -> Non
         "routstr.wallet.slow_filter_spend_proofs",
         AsyncMock(side_effect=lambda proofs, wallet: proofs),
     ), patch(
-        "routstr.wallet.db.balances_for_mint_and_unit", AsyncMock(return_value=0)
+        "routstr.wallet.db.balances_by_mint_and_unit", AsyncMock(return_value={})
     ), patch("routstr.wallet.raw_send_to_lnurl", raw_send):
         with pytest.raises(_LoopBreak):
             await periodic_payout()
@@ -112,7 +112,7 @@ async def test_periodic_payout_isolates_failing_mint() -> None:
         "routstr.wallet.slow_filter_spend_proofs",
         AsyncMock(side_effect=lambda proofs, wallet: proofs),
     ), patch(
-        "routstr.wallet.db.balances_for_mint_and_unit", AsyncMock(return_value=0)
+        "routstr.wallet.db.balances_by_mint_and_unit", AsyncMock(return_value={})
     ), patch("routstr.wallet.raw_send_to_lnurl", raw_send):
         with pytest.raises(_LoopBreak):
             await periodic_payout()
@@ -124,6 +124,63 @@ async def test_periodic_payout_isolates_failing_mint() -> None:
     ]
     assert len(good_calls) == 2  # sat + msat
     assert raw_send.await_count == 2  # good mint paid for both units
+
+
+@pytest.mark.asyncio
+async def test_periodic_payout_reads_liability_fresh_per_iteration() -> None:
+    """The liability must be read fresh inside the loop, after the mint round-trip.
+
+    Reading all liabilities once *before* the loop lets a user top-up during the
+    slow, per-mint payout cycle go unseen: a later (mint, unit) then computes
+    ``available_balance = fresh_proofs - stale_liability`` and can over-send
+    funds owed to users. The read must happen per (mint, unit), after the inner
+    ``asyncio.sleep(5)``, so it reflects the balance at payout time.
+    """
+    from routstr.core.settings import settings
+
+    events: list[str] = []
+
+    async def _sleep(seconds: float) -> None:
+        if seconds == _INTERVAL:
+            events.append("interval")
+            if events.count("interval") >= 2:
+                raise _LoopBreak()
+        else:
+            events.append(f"sleep{int(seconds)}")
+
+    async def _liability(
+        session: Any, mint_urls: list[str], units: list[str]
+    ) -> dict[tuple[str, str], int]:
+        events.append("liability")
+        return {}
+
+    with patch.object(settings, "cashu_mints", ["http://m:3338"]), patch.object(
+        settings, "primary_mint", "http://m:3338"
+    ), patch.object(settings, "receive_ln_address", "owner@ln.tld"), patch.object(
+        settings, "payout_interval_seconds", _INTERVAL
+    ), patch.object(settings, "min_payout_sat", 10), patch(
+        "routstr.wallet.asyncio.sleep", _sleep
+    ), patch("routstr.wallet.db.create_session", _fake_session), patch(
+        "routstr.wallet.get_wallet", AsyncMock(return_value=MagicMock())
+    ), patch(
+        "routstr.wallet.get_proofs_per_mint_and_unit",
+        MagicMock(return_value=[MagicMock(amount=100_000)]),
+    ), patch(
+        "routstr.wallet.slow_filter_spend_proofs",
+        AsyncMock(side_effect=lambda proofs, wallet: proofs),
+    ), patch(
+        "routstr.wallet.db.balances_by_mint_and_unit",
+        AsyncMock(side_effect=_liability),
+    ), patch("routstr.wallet.raw_send_to_lnurl", AsyncMock(return_value=1000)):
+        with pytest.raises(_LoopBreak):
+            await periodic_payout()
+
+    # One fresh liability read per (mint, unit) pair (sat + msat), not a single
+    # pre-loop snapshot shared across the whole cycle.
+    assert events.count("liability") == 2
+    # And the first read happens only after the first inner mint sleep, proving
+    # it is read inside the loop at payout time rather than before it.
+    assert events.index("liability") > events.index("sleep5")
 
 
 @pytest.mark.asyncio

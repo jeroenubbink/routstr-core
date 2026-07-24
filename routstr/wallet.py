@@ -837,7 +837,7 @@ async def fetch_all_balances(
         units = ["sat", "msat"]
 
     async def fetch_balance(
-        session: db.AsyncSession, mint_url: str, unit: str
+        mint_url: str, unit: str, user_balance: int
     ) -> BalanceDetail:
         try:
             wallet = await get_wallet(mint_url, unit)
@@ -845,7 +845,6 @@ async def fetch_all_balances(
                 wallet, mint_url, unit, not_reserved=True
             )
             proofs = await slow_filter_spend_proofs(proofs, wallet)
-            user_balance = await db.balances_for_mint_and_unit(session, mint_url, unit)
             if unit == "sat":
                 user_balance = user_balance // 1000
             proofs_balance = sum(proof.amount for proof in proofs)
@@ -878,40 +877,66 @@ async def fetch_all_balances(
     if settings.primary_mint and settings.primary_mint not in mint_urls:
         mint_urls.append(settings.primary_mint)
 
-    # Create tasks for all mint/unit combinations
-    async with db.create_session() as session:
-        tasks = [
-            fetch_balance(session, mint_url, unit)
-            for mint_url in mint_urls
-            for unit in units
-        ]
+    # Read all outstanding user liabilities up front in one short-lived DB
+    # session and a single grouped query. AsyncSession is not safe for
+    # concurrent use, so the session must NOT be shared across the gathered
+    # mint checks below (that raises "concurrent operations are not permitted"
+    # and can wedge connections until the pool is exhausted). A DB failure here
+    # must still degrade gracefully rather than 500 the whole balances page.
+    user_balances: dict[tuple[str, str], int] = {}
+    liabilities_error: str | None = None
+    try:
+        async with db.create_session() as session:
+            user_balances = await db.balances_by_mint_and_unit(
+                session, mint_urls, units
+            )
+    except Exception as e:
+        logger.error(f"Error reading user balances: {e}")
+        liabilities_error = str(e)
 
-        # Run all tasks concurrently
-        balance_details = list(await asyncio.gather(*tasks))
+    # Run the per-mint balance checks concurrently — no DB session involved.
+    tasks = [
+        fetch_balance(mint_url, unit, user_balances.get((mint_url, unit), 0))
+        for mint_url in mint_urls
+        for unit in units
+    ]
+    balance_details = list(await asyncio.gather(*tasks))
 
-    # Calculate totals
+    # Compute totals BEFORE tagging any liability-read failure. A failed
+    # liability read does not invalidate custody, so the known wallet balance
+    # must still be summed; only the per-user split is unknowable. A per-mint
+    # fetch failure (``error`` already set inside fetch_balance) means custody
+    # for that mint is genuinely unknown, so those details are skipped.
     total_wallet_balance_sats = 0
     total_user_balance_sats = 0
-
     for detail in balance_details:
-        if not detail.get("error"):
-            # Convert to sats for total calculation
-            unit = detail["unit"]
-            proofs_balance_sats = (
-                detail["wallet_balance"]
-                if unit == "sat"
-                else detail["wallet_balance"] // 1000
-            )
-            user_balance_sats = (
+        if detail.get("error"):
+            continue
+        unit = detail["unit"]
+        total_wallet_balance_sats += (
+            detail["wallet_balance"]
+            if unit == "sat"
+            else detail["wallet_balance"] // 1000
+        )
+        if liabilities_error is None:
+            total_user_balance_sats += (
                 detail["user_balance"]
                 if unit == "sat"
                 else detail["user_balance"] // 1000
             )
 
-            total_wallet_balance_sats += proofs_balance_sats
-            total_user_balance_sats += user_balance_sats
-
-    owner_balance = total_wallet_balance_sats - total_user_balance_sats
+    if liabilities_error is None:
+        owner_balance = total_wallet_balance_sats - total_user_balance_sats
+    else:
+        # Liabilities are unknown: report custody truthfully but never claim any
+        # of it as owner profit (owner = wallet - unknown liabilities). Surface
+        # the failure on each detail without discarding a more specific per-mint
+        # error, and blank the unknowable per-user/owner split.
+        owner_balance = 0
+        for detail in balance_details:
+            detail["user_balance"] = 0
+            detail["owner_balance"] = 0
+            detail.setdefault("error", liabilities_error)
 
     return (
         balance_details,
@@ -935,9 +960,10 @@ async def periodic_payout() -> None:
             if settings.primary_mint and settings.primary_mint not in mint_urls:
                 mint_urls.append(settings.primary_mint)
 
+            units = ["sat", "msat"]
             async with db.create_session() as session:
                 for mint_url in mint_urls:
-                    for unit in ["sat", "msat"]:
+                    for unit in units:
                         # Isolate failures per mint/unit so one slow or failing
                         # mint does not abort payout for every other mint/unit.
                         try:
@@ -947,9 +973,17 @@ async def periodic_payout() -> None:
                             )
                             proofs = await slow_filter_spend_proofs(proofs, wallet)
                             await asyncio.sleep(5)
-                            user_balance = await db.balances_for_mint_and_unit(
-                                session, mint_url, unit
+                            # Read the liability fresh, right before deciding the
+                            # payout. The mint round-trip above is slow; reading
+                            # it once before the loop would let a user top-up
+                            # during the cycle go unseen, so a later (mint, unit)
+                            # would act on a stale-low liability and over-send
+                            # funds owed to users. The loop is sequential, so
+                            # reusing this session per iteration is safe.
+                            balances = await db.balances_by_mint_and_unit(
+                                session, [mint_url], [unit]
                             )
+                            user_balance = balances.get((mint_url, unit), 0)
                             if unit == "sat":
                                 user_balance = user_balance // 1000
                             proofs_balance = sum(proof.amount for proof in proofs)

@@ -13,7 +13,9 @@ from alembic import command
 from alembic.config import Config
 from alembic.util.exc import CommandError
 from sqlalchemy import Index, UniqueConstraint, case, delete, or_
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio.engine import create_async_engine
 from sqlalchemy.orm import aliased
 from sqlmodel import Field, Relationship, SQLModel, col, func, select, update
@@ -26,7 +28,48 @@ logger = get_logger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///keys.db")
 
 
-engine = create_async_engine(DATABASE_URL, echo=False)  # echo=True for debugging SQL
+def create_db_engine(database_url: str = DATABASE_URL) -> AsyncEngine:
+    """Build the async engine, sizing the connection pool from ``settings``.
+
+    Pool sizing comes from the pydantic ``Settings`` (validated at boot like
+    every other typed env var), so an out-of-range value refuses to start rather
+    than running misconfigured. Defaults match SQLAlchemy's own baseline
+    (5 / 10 / 30s); operators only need to tune them when logs show
+    ``QueuePool limit ... reached, connection timed out`` — see the "Database
+    tuning" section of ``.env.example``. The effective config is logged so it can
+    be confirmed from the boot output during an incident.
+
+    In-memory SQLite is a special case: it uses ``StaticPool``, which rejects
+    the pool-sizing kwargs (passing them raises ``TypeError``), and there is no
+    pool to size anyway — so those URLs are built without them.
+    """
+    from .settings import settings
+
+    url = make_url(database_url)
+    is_memory_sqlite = url.get_backend_name() == "sqlite" and url.database in (
+        None,
+        "",
+        ":memory:",
+    )
+    if is_memory_sqlite:
+        logger.info("Database pool: in-memory SQLite, using default StaticPool")
+        return create_async_engine(database_url, echo=False)
+
+    logger.info(
+        f"Database pool configured: pool_size={settings.database_pool_size} "
+        f"max_overflow={settings.database_max_overflow} "
+        f"pool_timeout={settings.database_pool_timeout}s",
+    )
+    return create_async_engine(  # echo=True for debugging SQL
+        database_url,
+        echo=False,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout,
+    )
+
+
+engine = create_db_engine()
 
 
 class ApiKey(SQLModel, table=True):  # type: ignore

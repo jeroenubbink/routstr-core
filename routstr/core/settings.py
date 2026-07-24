@@ -100,6 +100,14 @@ class Settings(BaseSettings):
     refund_cache_ttl_seconds: int = Field(default=3600, env="REFUND_CACHE_TTL_SECONDS")
     refund_sweep_ttl_seconds: int = Field(default=604800, env="REFUND_SWEEP_TTL_SECONDS")
 
+    # Database connection-pool sizing (advanced). Defaults match SQLAlchemy's own
+    # baseline, so unset is behaviour-neutral — see the "Database tuning" section
+    # of .env.example. A pool_size of 0 would mean an unbounded pool in
+    # SQLAlchemy, so it is rejected (ge=1); max_overflow=0 (no overflow) is valid.
+    database_pool_size: int = Field(default=5, ge=1, env="DATABASE_POOL_SIZE")
+    database_max_overflow: int = Field(default=10, ge=0, env="DATABASE_MAX_OVERFLOW")
+    database_pool_timeout: int = Field(default=30, ge=1, env="DATABASE_POOL_TIMEOUT")
+
     # Logging
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     enable_console_logging: bool = Field(default=True, env="ENABLE_CONSOLE_LOGGING")
@@ -144,10 +152,25 @@ def _normalize_settings_data(data: dict[str, Any]) -> dict[str, Any]:
 # ``routstr.core.vault``.
 SECRET_FIELDS = frozenset({"admin_password", "nsec"})
 
+# Infrastructure the node needs *before* it can open a DB session — so it can
+# never be configured from the DB (chicken-and-egg) and stays env-only. Unlike
+# secrets (owned by bootstrap), these are excluded so the DB settings blob can
+# neither store nor shadow them; env is always authoritative.
+ENV_ONLY_FIELDS = frozenset(
+    {"database_pool_size", "database_max_overflow", "database_pool_timeout"}
+)
+
+_NON_PERSISTED_FIELDS = SECRET_FIELDS | ENV_ONLY_FIELDS
+
 
 def _strip_secret_fields(data: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``data`` without any secret fields (for persistence)."""
-    return {k: v for k, v in data.items() if k not in SECRET_FIELDS}
+    """Return a copy of ``data`` without secret or env-only fields.
+
+    Both are kept out of the persisted settings blob: secrets for confidentiality,
+    env-only fields (e.g. DB pool sizing) because they must never be sourced from
+    the database.
+    """
+    return {k: v for k, v in data.items() if k not in _NON_PERSISTED_FIELDS}
 
 
 def _apply_to_live_settings(data: dict[str, Any]) -> None:
@@ -327,7 +350,13 @@ class SettingsService:
             valid_fields = set(env_resolved.dict().keys())
             merged_dict: dict[str, Any] = dict(env_resolved.dict())
             merged_dict.update(
-                {k: v for k, v in db_json.items() if v not in (None, "", [], {}) and k in valid_fields}
+                {
+                    k: v
+                    for k, v in db_json.items()
+                    if v not in (None, "", [], {})
+                    and k in valid_fields
+                    and k not in ENV_ONLY_FIELDS
+                }
             )
             merged_dict = Settings(**merged_dict).dict()
 
@@ -394,8 +423,13 @@ class SettingsService:
                 )
             )
             await db_session.commit()
-            # Update in-place
+            # Update in-place. Env-only fields (e.g. DB pool sizing) are never
+            # applied here: the engine pool is already built at boot from env,
+            # so letting an update mutate the live value would only make it
+            # diverge from the running pool.
             for k, v in candidate.dict().items():
+                if k in ENV_ONLY_FIELDS:
+                    continue
                 setattr(settings, k, v)
             cls._current = settings
             return settings

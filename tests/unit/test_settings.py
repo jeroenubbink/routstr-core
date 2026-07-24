@@ -62,6 +62,68 @@ def test_payout_settings_have_sensible_defaults() -> None:
     assert s.payout_interval_seconds == 900
 
 
+@pytest.mark.asyncio
+async def test_database_pool_fields_are_env_only_not_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB pool sizing is infrastructure the node needs *before* it can read the
+    DB, so it can never be configured from the DB — it must never be written to
+    the settings blob, and a stale/injected DB value must never shadow env.
+    """
+    monkeypatch.setenv("DATABASE_POOL_SIZE", "7")
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        s = await SettingsService.initialize(session)
+
+        # The env value is live for runtime consumers...
+        assert s.database_pool_size == 7
+        # ...but pool sizing is never written to the settings blob.
+        blob = await _read_settings_blob(session)
+        assert "database_pool_size" not in blob
+        assert "database_max_overflow" not in blob
+        assert "database_pool_timeout" not in blob
+
+        # Even a stale blob that somehow carries a pool value must not win: env
+        # stays authoritative on the next initialize.
+        await session.exec(  # type: ignore
+            text("UPDATE settings SET data = :d WHERE id = 1").bindparams(
+                d=json.dumps({"database_pool_size": 99})
+            )
+        )
+        await session.commit()
+        again = await SettingsService.initialize(session)
+        assert again.database_pool_size == 7
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_apply_env_only_fields_to_live_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB pool sizing is env-only: a settings update must neither persist it nor
+    mutate the live value. The engine pool is already built at boot from env, so
+    a UI/API update carrying a pool value must not make the live setting diverge
+    from the running pool.
+    """
+    monkeypatch.delenv("DATABASE_POOL_SIZE", raising=False)
+    monkeypatch.setattr(settings, "database_pool_size", 5)
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await SettingsService.initialize(session)
+        await SettingsService.update(
+            {"database_pool_size": 99, "name": "PoolTweaker"}, session
+        )
+
+        # A non-env-only field still updates normally...
+        assert settings.name == "PoolTweaker"
+        # ...but the env-only pool size stays at the boot value.
+        assert settings.database_pool_size == 5
+        # ...and it is never written to the settings blob.
+        blob = await _read_settings_blob(session)
+        assert "database_pool_size" not in blob
+
+
 @pytest.mark.parametrize(
     "field,bad_value",
     [

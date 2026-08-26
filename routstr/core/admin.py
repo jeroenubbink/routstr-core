@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 import secrets
 from datetime import datetime, timezone
@@ -13,7 +14,12 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from ..payment.models import (
     BILLABLE_PRICING_FIELDS,
+    Model,
+    Pricing,
+    PricingSource,
     _row_to_model,
+    backfill_cache_pricing,
+    has_usable_pricing,
     is_usable_rate,
     list_models,
 )
@@ -525,6 +531,24 @@ class ModelCreate(BaseModel):
     alias_ids: list[str] | None = None
     enabled: bool = True
     forwarded_model_id: str | None = None
+    pricing_source: str | None = None
+
+    @field_validator("pricing_source")
+    @classmethod
+    def _validate_pricing_source(cls, value: str | None) -> str | None:
+        """Reject a tag that is not a known source.
+
+        Junk would be persisted and then read back as nothing: the provenance is
+        lost silently, and a zero price is left without the source the write
+        guard needs to judge it. A 422 reports the client bug instead.
+        """
+        if value is None:
+            return None
+        try:
+            return PricingSource(value).value
+        except ValueError:
+            allowed = ", ".join(source.value for source in PricingSource)
+            raise ValueError(f"pricing_source must be one of: {allowed}")
 
     @field_validator("pricing")
     @classmethod
@@ -557,6 +581,168 @@ class ModelCreate(BaseModel):
         return value
 
 
+# The subset of the billable rates whose positive value actually produces a
+# charge. ``max_cost`` is derived from the token rates alone, so a price built
+# purely from ``request``, ``image``, ``web_search`` or ``internal_reasoning``
+# is advertised but never collected: it reserves the floor and settles there.
+#
+# That the wider rates never reach ``max_cost`` is a billed-cost gap this module
+# does not fix. The narrower set exists so the write guard does not vouch for a
+# collection the node cannot make.
+COLLECTIBLE_PRICING_FIELDS = (
+    "prompt",
+    "completion",
+)
+
+
+def has_chargeable_price(pricing: Pricing) -> bool:
+    """True if every billable rate is usable and a collectible one is positive.
+
+    "Chargeable" has to mean *collectible*, so positivity is asked only of
+    ``COLLECTIBLE_PRICING_FIELDS`` — vouching for a price the node cannot
+    collect on would be the opposite of failing closed.
+
+    Well-formedness is still asked of *every* billable rate: one unusable rate
+    disqualifies the price even alongside a valid one, since a request can bill
+    on the bad field. Asking usability first is what makes that hold —
+    ``any(rate > 0)`` on its own is satisfied by the good field and never looks
+    at the bad one.
+
+    This predicate lives here, next to the write paths, rather than beside the
+    other pricing predicates. Asking whether a price is *free* is a question for
+    the operator writing it, not for the code serving it: a guard that runs at
+    serve or route time has to ask whether the node can collect on a request in
+    flight, which is a different and much larger question. Keeping the
+    definition on this side of the import graph keeps the two apart.
+    """
+    if not has_usable_pricing(pricing):
+        return False
+    return any(getattr(pricing, field) > 0 for field in COLLECTIBLE_PRICING_FIELDS)
+
+
+def _as_price(value: object) -> float | None:
+    """Coerce a payload rate to ``float``, tolerating numeric strings.
+
+    Payload pricing is ``dict[str, object]`` and some JSON producers emit rates
+    as strings (``"0"``, ``"0.000005"``). The stored JSON is later read by
+    ``Pricing.parse_obj``, which coerces those strings to floats, so the edit
+    check has to interpret them the same way — otherwise a string-typed edit
+    slips past and keeps a stale trusted tag. Anything else yields ``None``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, str)):
+        # An oversized int raises OverflowError, not ValueError; both mean "not
+        # a usable rate" here. ``_validate_pricing`` already rejects such a
+        # write with a 422, so neither is reachable through the admin API; the
+        # catch keeps the helper total instead of letting a coercion failure
+        # escape as a 500.
+        try:
+            return float(value)
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def _canonical_pricing(payload: "ModelCreate") -> Pricing:
+    """One complete price from the payload, used to compare *and* to persist.
+
+    The write replaces the whole stored price, which is later reparsed with any
+    missing rate defaulting to zero. Building that same object here — and
+    comparing and persisting *it* rather than the raw payload dict — closes the
+    gap where a payload that omits a priced rate reads as "unchanged" while
+    silently dropping the rate to zero.
+    """
+    values = {
+        field: (_as_price(payload.pricing.get(field)) or 0.0)
+        for field in BILLABLE_PRICING_FIELDS
+    }
+    return Pricing(**values)
+
+
+def _pricing_edited(canonical: Pricing, existing: Model, model_id: str) -> bool:
+    """True if the canonical price differs from what the operator was shown.
+
+    ``existing`` is the fee-free view the admin UI renders, not the raw stored
+    JSON: that view backfills cache rates on read, and the UI round-trips rates
+    between per-token and per-million, so a faithful "save as fetched" can
+    legitimately differ from the stored JSON. Comparing with ``isclose`` against
+    the view is what keeps such a save from reading as an edit.
+
+    The canonical price is backfilled the *same* way before the comparison, so a
+    client that omits a backfill-derived cache rate is compared like for like —
+    storing zero for it is re-backfilled on the next read, so the effective
+    price is unchanged. A rate the backfill never supplies (``request``, say)
+    has no such twin, so dropping it still reads as the real change it is.
+    """
+    compare = backfill_cache_pricing(model_id, canonical)
+    return any(
+        not math.isclose(
+            getattr(compare, field),
+            getattr(existing.pricing, field),
+            rel_tol=1e-9,
+            abs_tol=0.0,
+        )
+        for field in BILLABLE_PRICING_FIELDS
+    )
+
+
+def _existing_view_for_provenance(row: ModelRow) -> Model | None:
+    """The fee-free view of a stored row, or ``None`` if it cannot be read.
+
+    This view exists only to answer "did the operator edit the price they were
+    shown". A row whose stored price will not parse was never shown as a price
+    at all — the served catalog already holds it back — so there is nothing to
+    compare against and ``None`` is the honest answer. The write is then treated
+    as a create, which is also correct: an operator replacing an unreadable
+    price owns the replacement.
+
+    Letting the parse failure escape instead would make the admin API refuse to
+    fix precisely the rows that most need fixing, leaving them permanently
+    unrepairable behind a 500. Reading a row must never be able to veto
+    overwriting it.
+    """
+    try:
+        return _row_to_model(row, apply_provider_fee=False)
+    except (PydanticValidationError, ValueError, TypeError) as exc:
+        # json.JSONDecodeError is a ValueError, so malformed JSON lands here too.
+        logger.warning(
+            "Stored pricing for a model is unreadable; treating the write as an "
+            "operator-owned replacement",
+            extra={"model_id": row.id, "error": str(exc)},
+        )
+        return None
+
+
+def _resolve_provenance(
+    canonical: Pricing, payload: "ModelCreate", existing: Model | None
+) -> str | None:
+    """The provenance to persist for a write.
+
+    - Update, price edited → ``manual``: the operator owns this price.
+    - Update, price unchanged → adopt the payload's source if it carries one (a
+      "save as fetched" refreshes it), else keep what the row already claimed.
+    - Create → adopt the payload's source if present; else a real price is
+      ``manual``, because a hand-added price is operator-entered, while a zero
+      price is ``unresolved``: a client that omits the tag cannot tell a
+      deliberate free import from an unpriced one, and it must not be laundered
+      into an operator's vouch for a billable model that bills nothing.
+    """
+    if existing is not None:
+        model_id = existing.forwarded_model_id or existing.id
+        if _pricing_edited(canonical, existing, model_id):
+            return PricingSource.MANUAL.value
+        if payload.pricing_source is not None:
+            return payload.pricing_source
+        source = existing.pricing_source
+        return source.value if source is not None else None
+    if payload.pricing_source is not None:
+        return payload.pricing_source
+    if not has_chargeable_price(canonical):
+        return PricingSource.UNRESOLVED.value
+    return PricingSource.MANUAL.value
+
+
 def _normalize_forwarded_model_id(value: str | None) -> str | None:
     if value is None:
         return None
@@ -580,15 +766,22 @@ async def upsert_provider_model(
         # Try to get existing model
         existing_row = await session.get(ModelRow, (payload.id, provider_pk))
 
+        # One canonical price, compared and persisted identically.
+        canonical = _canonical_pricing(payload)
+
         if existing_row:
             # Update existing model
             logger.info(f"Updating existing model: {payload.id}")
+            # Snapshot the fee-free view before mutating, so a price edit is
+            # detected against what the operator was actually shown.
+            existing_model = _existing_view_for_provenance(existing_row)
+            source = _resolve_provenance(canonical, payload, existing_model)
             existing_row.name = payload.name
             existing_row.description = payload.description
             existing_row.created = int(payload.created)
             existing_row.context_length = int(payload.context_length)
             existing_row.architecture = json.dumps(payload.architecture)
-            existing_row.pricing = json.dumps(payload.pricing)
+            existing_row.pricing = json.dumps(canonical.dict())
             existing_row.sats_pricing = None
             existing_row.per_request_limits = (
                 json.dumps(payload.per_request_limits)
@@ -607,6 +800,7 @@ async def upsert_provider_model(
                 existing_row.forwarded_model_id = _normalize_forwarded_model_id(
                     payload.forwarded_model_id
                 )
+            existing_row.pricing_source = source
 
             session.add(existing_row)
             await session.commit()
@@ -616,6 +810,7 @@ async def upsert_provider_model(
         else:
             # Create new model
             logger.info(f"Creating new model: {payload.id}")
+            source = _resolve_provenance(canonical, payload, None)
             row = ModelRow(
                 id=payload.id,
                 name=payload.name,
@@ -623,7 +818,7 @@ async def upsert_provider_model(
                 created=int(payload.created),
                 context_length=int(payload.context_length),
                 architecture=json.dumps(payload.architecture),
-                pricing=json.dumps(payload.pricing),
+                pricing=json.dumps(canonical.dict()),
                 sats_pricing=None,
                 per_request_limits=(
                     json.dumps(payload.per_request_limits)
@@ -642,6 +837,7 @@ async def upsert_provider_model(
                 forwarded_model_id=_normalize_forwarded_model_id(
                     payload.forwarded_model_id
                 ),
+                pricing_source=source,
             )
             session.add(row)
             await session.commit()
@@ -757,14 +953,19 @@ async def batch_override_provider_models(
             # Try to get existing model regardless of whether it's enabled or not
             existing_row = await session.get(ModelRow, (model_data.id, provider_pk))
 
+            # One canonical price, compared and persisted identically.
+            canonical = _canonical_pricing(model_data)
+
             if existing_row:
                 # Update existing
+                existing_model = _existing_view_for_provenance(existing_row)
+                source = _resolve_provenance(canonical, model_data, existing_model)
                 existing_row.name = model_data.name
                 existing_row.description = model_data.description
                 existing_row.created = int(model_data.created)
                 existing_row.context_length = int(model_data.context_length)
                 existing_row.architecture = json.dumps(model_data.architecture)
-                existing_row.pricing = json.dumps(model_data.pricing)
+                existing_row.pricing = json.dumps(canonical.dict())
                 existing_row.sats_pricing = None
                 existing_row.per_request_limits = (
                     json.dumps(model_data.per_request_limits)
@@ -785,9 +986,11 @@ async def batch_override_provider_models(
                     existing_row.forwarded_model_id = _normalize_forwarded_model_id(
                         model_data.forwarded_model_id
                     )
+                existing_row.pricing_source = source
                 session.add(existing_row)
             else:
                 # Create new
+                source = _resolve_provenance(canonical, model_data, None)
                 row = ModelRow(
                     id=model_data.id,
                     name=model_data.name,
@@ -795,7 +998,7 @@ async def batch_override_provider_models(
                     created=int(model_data.created),
                     context_length=int(model_data.context_length),
                     architecture=json.dumps(model_data.architecture),
-                    pricing=json.dumps(model_data.pricing),
+                    pricing=json.dumps(canonical.dict()),
                     sats_pricing=None,
                     per_request_limits=(
                         json.dumps(model_data.per_request_limits)
@@ -818,6 +1021,7 @@ async def batch_override_provider_models(
                     forwarded_model_id=_normalize_forwarded_model_id(
                         model_data.forwarded_model_id
                     ),
+                    pricing_source=source,
                 )
                 session.add(row)
 

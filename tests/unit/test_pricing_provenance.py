@@ -586,3 +586,106 @@ async def test_an_ollama_model_nothing_can_price_imports_disabled() -> None:
     model = _model_by_id(models, "nobody-prices-this-ollama-qqq")
     assert model.pricing_source is PricingSource.UNRESOLVED
     assert model.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# tinfoil — publishes its own rates, but defaults every one of them to zero
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_tinfoil(payload: dict[str, Any], or_feed: list[dict]) -> list[Model]:
+    from routstr.upstream.tinfoil import TinfoilUpstreamProvider
+
+    provider = TinfoilUpstreamProvider(api_key="tf-test-key")
+    with patch(
+        "routstr.upstream.tinfoil.httpx.AsyncClient",
+        lambda *a, **k: _FakeAsyncClient(payload),
+    ):
+        with patch(
+            "routstr.payment.models.async_fetch_openrouter_models",
+            AsyncMock(return_value=or_feed),
+        ):
+            return await provider.fetch_models()
+
+
+@pytest.mark.asyncio
+async def test_a_tinfoil_published_price_is_the_providers_own() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "llama-tinfoil-3",
+                "context_window": 16384,
+                "pricing": {
+                    "inputTokenPricePer1M": 0.5,
+                    "outputTokenPricePer1M": 1.5,
+                },
+            }
+        ]
+    }
+
+    models = await _fetch_tinfoil(payload, [])
+
+    model = _model_by_id(models, "llama-tinfoil-3")
+    assert model.pricing_source is PricingSource.NATIVE
+    assert model.pricing.prompt == 0.5 / 1_000_000
+    assert model.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_a_tinfoil_model_without_pricing_is_priced_elsewhere() -> None:
+    """Tinfoil's pricing fields default to zero, so a model it ships without
+    pricing is indistinguishable from a free one and would be served free."""
+    payload = {"data": [{"id": "exotic-tinfoil-zzz", "context_window": 8192}]}
+    or_feed = [
+        {
+            "id": "exotic-tinfoil-zzz",
+            "context_length": 8192,
+            "pricing": {"prompt": "0.000004", "completion": "0.000008"},
+        }
+    ]
+
+    models = await _fetch_tinfoil(payload, or_feed)
+
+    model = _model_by_id(models, "exotic-tinfoil-zzz")
+    assert model.pricing_source is PricingSource.OPENROUTER
+    assert model.pricing.prompt == 0.000004
+    assert model.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_a_tinfoil_model_nothing_can_price_imports_disabled() -> None:
+    payload = {
+        "data": [{"id": "nobody-prices-this-tinfoil-qqq", "context_window": 4096}]
+    }
+
+    models = await _fetch_tinfoil(payload, [])
+
+    model = _model_by_id(models, "nobody-prices-this-tinfoil-qqq")
+    assert model.pricing_source is PricingSource.UNRESOLVED
+    assert model.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_tinfoil_rate_is_not_the_providers_price() -> None:
+    """``json.loads`` accepts the bare ``Infinity``/``NaN`` literals and
+    overflows ``1e999`` to ``inf``, so junk really does arrive from a feed. It
+    falls through to the shared chain rather than being published as a trusted
+    price."""
+    payload = {
+        "data": [
+            {
+                "id": "deepseek-chat",
+                "context_window": 8192,
+                "pricing": {
+                    "inputTokenPricePer1M": float("inf"),
+                    "outputTokenPricePer1M": float("nan"),
+                },
+            }
+        ]
+    }
+
+    models = await _fetch_tinfoil(payload, [])
+
+    model = _model_by_id(models, "deepseek-chat")
+    assert model.pricing_source is PricingSource.LITELLM
+    assert model.pricing.prompt > 0

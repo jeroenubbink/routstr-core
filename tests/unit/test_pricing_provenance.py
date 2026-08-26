@@ -267,3 +267,73 @@ def test_the_provider_fee_rebuild_preserves_provenance() -> None:
     )
 
     assert rebuilt.pricing_source is PricingSource.NATIVE
+
+
+# ---------------------------------------------------------------------------
+# a backfilled cache rate makes the price mixed-source
+# ---------------------------------------------------------------------------
+
+
+def _fee_rebuild(model: Model) -> Model:
+    return GenericUpstreamProvider(base_url="http://x")._apply_provider_fee_to_model(
+        model
+    )
+
+
+def test_a_backfilled_cache_rate_stops_a_price_claiming_native() -> None:
+    """The tag speaks for the whole price, so it can only honestly name the
+    least-trusted source that contributed a rate to it. A price the provider
+    supplied, wearing a cache rate the bundled cost map supplied, is no longer
+    wholly the provider's."""
+    model = _model_with_source(PricingSource.NATIVE, model_id="gpt-4o")
+    assert model.pricing.input_cache_read == 0.0
+
+    rebuilt = _fee_rebuild(model)
+
+    assert rebuilt.pricing.input_cache_read > 0.0
+    assert rebuilt.pricing_source is PricingSource.LITELLM
+
+
+def test_a_backfill_never_promotes_a_less_trusted_price() -> None:
+    """A backfill is not evidence in a price's favour: an openrouter price is
+    already below litellm, so mixing one in must change nothing."""
+    model = _model_with_source(PricingSource.OPENROUTER, model_id="gpt-4o")
+
+    rebuilt = _fee_rebuild(model)
+
+    assert rebuilt.pricing.input_cache_read > 0.0
+    assert rebuilt.pricing_source is PricingSource.OPENROUTER
+
+
+def test_a_backfill_does_not_revoke_an_operator_vouch() -> None:
+    """``manual`` is the operator's own statement about the price, and it is
+    what lets a deliberately free model be enabled at all. A cache lookup must
+    not silently strip that vouch."""
+    model = _model_with_source(PricingSource.MANUAL, model_id="gpt-4o")
+
+    rebuilt = _fee_rebuild(model)
+
+    assert rebuilt.pricing.input_cache_read > 0.0
+    assert rebuilt.pricing_source is PricingSource.MANUAL
+
+
+def test_a_price_the_cost_map_cannot_touch_keeps_its_own_claim() -> None:
+    """Only an actual contribution downgrades the tag."""
+    model = _model_with_source(PricingSource.NATIVE, model_id="m1")
+
+    rebuilt = _fee_rebuild(model)
+
+    assert rebuilt.pricing.input_cache_read == 0.0
+    assert rebuilt.pricing_source is PricingSource.NATIVE
+
+
+def test_reading_a_row_back_owes_the_same_correction() -> None:
+    """The database read path backfills the same rates from the same source, so
+    a stored ``native`` row read back with a borrowed cache rate is mixed-source
+    exactly as the fetch path's is."""
+    model = _row_to_model(
+        _row("gpt-4o", {"prompt": 5e-06, "completion": 1.5e-05}, "native")
+    )
+
+    assert model.pricing.input_cache_read > 0.0
+    assert model.pricing_source is PricingSource.LITELLM

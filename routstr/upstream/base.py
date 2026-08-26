@@ -48,6 +48,7 @@ from ..payment.models import (
     backfill_cache_pricing,
     list_models,
     pricing_metadata,
+    source_after_cache_backfill,
 )
 from ..payment.price import sats_usd_price
 from ..wallet import (
@@ -5152,7 +5153,9 @@ class BaseUpstreamProvider:
 
         Cache rates missing from the upstream pricing feed are backfilled from
         litellm's cost map first, so they carry the provider fee like every
-        other price component.
+        other price component. A backfill that actually contributes a rate also
+        downgrades ``pricing_source``, so the resulting price never claims a
+        source it is no longer wholly from.
 
         Args:
             model: Model object to update
@@ -5161,6 +5164,12 @@ class BaseUpstreamProvider:
             Model with provider fee applied to pricing and max costs calculated
         """
         base_pricing = backfill_cache_pricing(model.id, model.pricing)
+
+        # Backfilling from the bundled cost map makes the price mixed-source;
+        # the whole-price tag has to stop claiming the provider priced all of it.
+        resolved_source = source_after_cache_backfill(
+            model.pricing, base_pricing, model.pricing_source
+        )
         adjusted_pricing = Pricing.parse_obj(
             {k: v * self.provider_fee for k, v in base_pricing.dict().items()}
         )
@@ -5181,7 +5190,7 @@ class BaseUpstreamProvider:
             canonical_slug=model.canonical_slug,
             alias_ids=model.alias_ids,
             forwarded_model_id=model.forwarded_model_id,
-            pricing_source=model.pricing_source,
+            pricing_source=resolved_source,
         )
 
         (
@@ -5206,7 +5215,7 @@ class BaseUpstreamProvider:
             canonical_slug=model.canonical_slug,
             alias_ids=model.alias_ids,
             forwarded_model_id=model.forwarded_model_id,
-            pricing_source=model.pricing_source,
+            pricing_source=resolved_source,
         )
 
     async def fetch_models(self) -> list[Model]:

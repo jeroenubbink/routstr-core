@@ -10,7 +10,15 @@ import httpx
 from pydantic.v1 import BaseModel, Field
 
 from ..core.logging import get_logger
-from ..payment.models import Architecture, Model, Pricing, async_fetch_openrouter_models
+from ..payment.models import (
+    Architecture,
+    Model,
+    Pricing,
+    PricingSource,
+    async_fetch_openrouter_models,
+    pricing_metadata,
+)
+from ..payment.rates import coerce_rate
 from .base import BaseUpstreamProvider, TopupData
 from .ehbp import EHBPForwardingTarget
 
@@ -99,6 +107,18 @@ async def _safe_read_request(
                 )
                 await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
+
+
+def _published_rate(value: object) -> float | None:
+    """A rate PPQ actually published, or ``None``.
+
+    ``coerce_rate`` answers whether this is a rate at all. Positivity is asked
+    on top of it because PPQ reports a side it did not price as ``0``, and here
+    that means *absent*, not free: overlaying a zero onto the matched feed rate
+    would bill those tokens at nothing under a tag claiming PPQ priced them.
+    """
+    rate = coerce_rate(value)
+    return rate if rate is not None and rate > 0 else None
 
 
 class PPQAIModelPricing(BaseModel):
@@ -238,12 +258,18 @@ class PPQAIUpstreamProvider(BaseUpstreamProvider):
                     )
 
                     if or_model:
+                        # Two PPQ ids can tail-match the same feed entry, so
+                        # copy before overlaying: mutating in place would
+                        # leave both models pointing at one object and let
+                        # the last writer's price become the other's too.
+                        or_model = or_model.copy(deep=True)
                         input_price = None
                         if ppqai_model.pricing.api:
                             input_price = ppqai_model.pricing.api.get("input_per_1M")
                         elif ppqai_model.pricing.input_per_1M_tokens:
                             input_price = ppqai_model.pricing.input_per_1M_tokens
 
+                        input_price = _published_rate(input_price)
                         if input_price is not None:
                             or_model.pricing.prompt = input_price / 1_000_000
 
@@ -253,28 +279,57 @@ class PPQAIUpstreamProvider(BaseUpstreamProvider):
                         elif ppqai_model.pricing.output_per_1M_tokens:
                             output_price = ppqai_model.pricing.output_per_1M_tokens
 
+                        output_price = _published_rate(output_price)
                         if output_price is not None:
                             or_model.pricing.completion = output_price / 1_000_000
+
+                        # Only a model PPQ priced on *both* sides is wholly
+                        # the provider's: with one side still feed-derived
+                        # the price is mixed, so the tag stays the feed's.
+                        #
+                        # PPQ publishes token rates and nothing else, so a
+                        # native price has to be built from only those.
+                        # Overlaying the two rates onto the matched entry
+                        # left its request, image, search, reasoning and
+                        # cache rates in place — the model was billed
+                        # auxiliary fees PPQ never charges, while the tag
+                        # claimed every rate came from the provider.
+                        if input_price is not None and output_price is not None:
+                            or_model.pricing = Pricing(
+                                prompt=input_price / 1_000_000,
+                                completion=output_price / 1_000_000,
+                            )
+                            for key, value in pricing_metadata(
+                                PricingSource.NATIVE
+                            ).items():
+                                setattr(or_model, key, value)
 
                         if cl := ppqai_model.context_length:
                             or_model.context_length = cl
                         models.append(or_model)
                     else:
-                        input_price = 0.0
+                        input_price = None
                         if ppqai_model.pricing.api:
-                            input_price = ppqai_model.pricing.api.get(
-                                "input_per_1M", 0.0
-                            )
+                            input_price = ppqai_model.pricing.api.get("input_per_1M")
                         elif ppqai_model.pricing.input_per_1M_tokens:
                             input_price = ppqai_model.pricing.input_per_1M_tokens
 
-                        output_price = 0.0
+                        output_price = None
                         if ppqai_model.pricing.api:
-                            output_price = ppqai_model.pricing.api.get(
-                                "output_per_1M", 0.0
-                            )
+                            output_price = ppqai_model.pricing.api.get("output_per_1M")
                         elif ppqai_model.pricing.output_per_1M_tokens:
                             output_price = ppqai_model.pricing.output_per_1M_tokens
+
+                        # PPQ's catalog price is the provider's own only
+                        # when it prices both sides. A partial, absent or
+                        # malformed price would bill a side at nothing or a
+                        # nonsensical amount, so — like a wholly unpriced
+                        # model — it fails closed and imports disabled.
+                        input_price = _published_rate(input_price)
+                        output_price = _published_rate(output_price)
+                        fully_priced = (
+                            input_price is not None and output_price is not None
+                        )
 
                         models.append(
                             Model(
@@ -291,12 +346,18 @@ class PPQAIUpstreamProvider(BaseUpstreamProvider):
                                     instruct_type=None,
                                 ),
                                 pricing=Pricing(
-                                    prompt=input_price / 1_000_000,
-                                    completion=output_price / 1_000_000,
+                                    prompt=(input_price or 0.0) / 1_000_000,
+                                    completion=(output_price or 0.0) / 1_000_000,
                                     request=0.0,
                                     image=0.0,
                                     web_search=0.0,
                                     internal_reasoning=0.0,
+                                ),
+                                enabled=fully_priced,
+                                **pricing_metadata(
+                                    PricingSource.NATIVE
+                                    if fully_priced
+                                    else PricingSource.UNRESOLVED
                                 ),
                             )
                         )

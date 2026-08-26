@@ -81,6 +81,16 @@ class _FakeAsyncClient:
     ) -> _FakeResponse:
         return _FakeResponse(self._payload)
 
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json: dict[str, object] | None = None,
+    ) -> _FakeResponse:
+        return _FakeResponse(self._payload)
+
 
 def _model_by_id(models: list[Any], model_id: str) -> Any:
     return next(m for m in models if m.id == model_id)
@@ -357,3 +367,180 @@ def test_reading_a_row_back_owes_the_same_correction() -> None:
 
     assert model.pricing.input_cache_read > 0.0
     assert model.pricing_source is PricingSource.LITELLM
+
+
+# ---------------------------------------------------------------------------
+# ppqai — its own published price is native, and only when it is a whole price
+# ---------------------------------------------------------------------------
+
+
+def _or_entry(model_id: str, **pricing: float) -> dict[str, Any]:
+    rates: dict[str, float] = {"prompt": 0.000001, "completion": 0.000002}
+    rates.update(pricing)
+    return {
+        "id": model_id,
+        "name": model_id,
+        "created": 0,
+        "description": "d",
+        "context_length": 8192,
+        "architecture": _ARCHITECTURE,
+        "pricing": rates,
+        "pricing_source": "openrouter",
+    }
+
+
+def _ppq_entry(model_id: str, **api: float) -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "name": model_id,
+        "created_at": 0,
+        "context_length": 8192,
+        "pricing": {"api": api} if api else {},
+    }
+
+
+async def _fetch_ppq(entries: list[dict[str, Any]], or_feed: list[dict]) -> list[Model]:
+    from routstr.upstream.ppqai import PPQAIUpstreamProvider
+
+    provider = PPQAIUpstreamProvider(api_key="k")
+    with patch(
+        "routstr.upstream.ppqai.httpx.AsyncClient",
+        lambda *a, **k: _FakeAsyncClient({"data": entries}),
+    ):
+        with patch(
+            "routstr.upstream.ppqai.async_fetch_openrouter_models",
+            AsyncMock(return_value=or_feed),
+        ):
+            return await provider.fetch_models()
+
+
+@pytest.mark.asyncio
+async def test_a_ppq_published_price_is_native_and_an_absent_one_is_not() -> None:
+    models = await _fetch_ppq(
+        [
+            _ppq_entry("ppq-priced", input_per_1M=1.0, output_per_1M=2.0),
+            _ppq_entry("ppq-free"),
+        ],
+        [],
+    )
+
+    assert _model_by_id(models, "ppq-priced").pricing_source is PricingSource.NATIVE
+    unpriced = _model_by_id(models, "ppq-free")
+    assert unpriced.pricing_source is PricingSource.UNRESOLVED
+    assert unpriced.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_a_half_priced_ppq_model_is_not_a_native_price() -> None:
+    """Billing the unpriced side at nothing is not a price PPQ published, so the
+    model fails closed rather than being served as confidently native."""
+    models = await _fetch_ppq([_ppq_entry("ppq-input-only", input_per_1M=1.0)], [])
+
+    model = _model_by_id(models, "ppq-input-only")
+    assert model.pricing_source is PricingSource.UNRESOLVED
+    assert model.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_a_negative_ppq_rate_is_not_a_price() -> None:
+    """A negative rate is malformed upstream data, and it is truthy: published
+    as a price it would credit the caller per token."""
+    models = await _fetch_ppq(
+        [_ppq_entry("ppq-negative", input_per_1M=-1.0, output_per_1M=-2.0)], []
+    )
+
+    model = _model_by_id(models, "ppq-negative")
+    assert model.pricing_source is PricingSource.UNRESOLVED
+    assert model.enabled is False
+    assert model.pricing.prompt >= 0
+    assert model.pricing.completion >= 0
+
+
+@pytest.mark.asyncio
+async def test_two_ppq_ids_matching_one_feed_entry_keep_their_own_prices() -> None:
+    """Two PPQ ids can tail-match the same feed entry. Overlaying onto the entry
+    in place would leave both models pointing at one object, so the last writer's
+    price and provenance would silently become the other's too."""
+    models = await _fetch_ppq(
+        [
+            _ppq_entry("gpt-4o", input_per_1M=5.0, output_per_1M=15.0),
+            _ppq_entry("openai/gpt-4o", input_per_1M=3.0, output_per_1M=10.0),
+        ],
+        [_or_entry("openai/gpt-4o")],
+    )
+
+    assert len(models) == 2
+    assert models[0] is not models[1]
+    assert {round(m.pricing.prompt * 1_000_000, 6) for m in models} == {5.0, 3.0}
+
+
+@pytest.mark.asyncio
+async def test_a_ppq_price_for_one_side_only_leaves_the_feed_as_the_source() -> None:
+    """The other side is still the feed's, so the whole-price tag cannot claim
+    the model is priced by the provider."""
+    models = await _fetch_ppq(
+        [_ppq_entry("gpt-4o", input_per_1M=5.0)], [_or_entry("gpt-4o")]
+    )
+
+    assert _model_by_id(models, "gpt-4o").pricing_source is PricingSource.OPENROUTER
+
+
+@pytest.mark.asyncio
+async def test_a_ppq_zero_does_not_overwrite_the_feed_price() -> None:
+    """PPQ reports an unpriced side as 0. Overlaying that would bill those
+    tokens at nothing; the feed's price for that side must stand."""
+    models = await _fetch_ppq(
+        [_ppq_entry("gpt-4o", input_per_1M=0, output_per_1M=15.0)],
+        [_or_entry("gpt-4o")],
+    )
+
+    model = _model_by_id(models, "gpt-4o")
+    assert model.pricing.prompt == pytest.approx(0.000001)
+    assert model.pricing.completion == pytest.approx(15.0 / 1_000_000)
+    assert model.pricing_source is PricingSource.OPENROUTER
+
+
+@pytest.mark.asyncio
+async def test_a_negative_ppq_rate_does_not_overwrite_the_feed_price() -> None:
+    models = await _fetch_ppq(
+        [_ppq_entry("gpt-4o", input_per_1M=-5.0, output_per_1M=-15.0)],
+        [_or_entry("gpt-4o")],
+    )
+
+    model = _model_by_id(models, "gpt-4o")
+    assert model.pricing.prompt == pytest.approx(0.000001)
+    assert model.pricing.completion == pytest.approx(0.000002)
+    assert model.pricing_source is PricingSource.OPENROUTER
+
+
+@pytest.mark.asyncio
+async def test_a_native_ppq_price_carries_no_rates_ppq_never_published() -> None:
+    """PPQ publishes token rates and nothing else. Overlaying those two onto a
+    matched feed entry left its request, image, search, reasoning and cache
+    rates in place — so the model was billed auxiliary fees PPQ does not charge
+    while the tag claimed every rate was the provider's own."""
+    models = await _fetch_ppq(
+        [_ppq_entry("gpt-4o", input_per_1M=5.0, output_per_1M=15.0)],
+        [
+            _or_entry(
+                "gpt-4o",
+                request=0.25,
+                image=0.5,
+                web_search=0.75,
+                internal_reasoning=0.0000003,
+                input_cache_read=0.0000001,
+                input_cache_write=0.0000002,
+            )
+        ],
+    )
+
+    model = _model_by_id(models, "gpt-4o")
+    assert model.pricing_source is PricingSource.NATIVE
+    assert model.pricing.prompt == pytest.approx(5.0 / 1_000_000)
+    assert model.pricing.completion == pytest.approx(15.0 / 1_000_000)
+    assert model.pricing.request == 0.0
+    assert model.pricing.image == 0.0
+    assert model.pricing.web_search == 0.0
+    assert model.pricing.internal_reasoning == 0.0
+    assert model.pricing.input_cache_read == 0.0
+    assert model.pricing.input_cache_write == 0.0

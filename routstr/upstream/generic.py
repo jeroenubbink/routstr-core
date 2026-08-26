@@ -106,7 +106,13 @@ class GenericUpstreamProvider(BaseUpstreamProvider):
 
     async def fetch_models(self) -> list[Model]:
         """Fetch models from upstream API using /models endpoint."""
-        from ..payment.models import Architecture, Model, Pricing, TopProvider
+        from ..payment.models import (
+            Architecture,
+            Model,
+            Pricing,
+            TopProvider,
+            pricing_metadata,
+        )
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -212,6 +218,7 @@ class GenericUpstreamProvider(BaseUpstreamProvider):
                             enabled=enabled,
                             upstream_provider_id=None,
                             canonical_slug=None,
+                            **pricing_metadata(resolved.source),
                         )
                     )
 

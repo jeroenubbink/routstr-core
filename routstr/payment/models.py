@@ -298,6 +298,11 @@ async def async_fetch_openrouter_models(source_filter: str | None = None) -> lis
                 if not _has_valid_pricing(model):
                     continue
 
+                # Every model in this feed is priced by OpenRouter. Tagging here
+                # rather than at each consumer means the ``Model(**model)``
+                # spreads in the feed-backed providers carry provenance with no
+                # per-provider code.
+                model.update(pricing_metadata(PricingSource.OPENROUTER))
                 filtered_models.append(model)
 
             return filtered_models

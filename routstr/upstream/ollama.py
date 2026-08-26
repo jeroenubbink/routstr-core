@@ -244,6 +244,7 @@ class OllamaUpstreamProvider(BaseUpstreamProvider):
             enabled=model.enabled,
             upstream_provider_id=model.upstream_provider_id,
             canonical_slug=model.canonical_slug,
+            pricing_source=model.pricing_source,
         )
 
         (
@@ -266,4 +267,5 @@ class OllamaUpstreamProvider(BaseUpstreamProvider):
             enabled=model.enabled,
             upstream_provider_id=model.upstream_provider_id,
             canonical_slug=model.canonical_slug,
+            pricing_source=model.pricing_source,
         )

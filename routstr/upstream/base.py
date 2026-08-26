@@ -43,10 +43,12 @@ from ..payment.helpers import create_error_response
 from ..payment.models import (
     Model,
     Pricing,
+    PricingSource,
     _calculate_usd_max_costs,
     _update_model_sats_pricing,
     backfill_cache_pricing,
     list_models,
+    pricing_metadata,
 )
 from ..payment.price import sats_usd_price
 from ..wallet import (
@@ -5251,6 +5253,7 @@ class BaseUpstreamProvider:
             canonical_slug=model.canonical_slug,
             alias_ids=model.alias_ids,
             forwarded_model_id=model.forwarded_model_id,
+            pricing_source=model.pricing_source,
         )
 
         (
@@ -5275,6 +5278,7 @@ class BaseUpstreamProvider:
             canonical_slug=model.canonical_slug,
             alias_ids=model.alias_ids,
             forwarded_model_id=model.forwarded_model_id,
+            pricing_source=model.pricing_source,
         )
 
     async def fetch_models(self) -> list[Model]:
@@ -5342,11 +5346,15 @@ class BaseUpstreamProvider:
                 if not isinstance(response, BaseException):
                     response.raise_for_status()
                     data = response.json()
-                    return [
-                        model
-                        for model in data.get("data", [])
-                        if ":free" not in model.get("id", "").lower()
-                    ]
+                    result = []
+                    for model in data.get("data", []):
+                        if ":free" in model.get("id", "").lower():
+                            continue
+                        # These are OpenRouter's prices; tag them so the
+                        # ``Model(**or_model)`` spread below carries provenance.
+                        model.update(pricing_metadata(PricingSource.OPENROUTER))
+                        result.append(model)
+                    return result
                 return []
 
             all_models.extend(process_models_response(models_response))

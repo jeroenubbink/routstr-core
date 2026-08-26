@@ -260,6 +260,52 @@ def backfill_cache_pricing(model_id: str, pricing: Pricing) -> Pricing:
     return updated
 
 
+# The rates ``backfill_cache_pricing`` can supply, and therefore the only ones
+# whose change is evidence that the bundled cost map contributed to a price.
+_CACHE_RATE_FIELDS = ("input_cache_read", "input_cache_write")
+
+
+def source_after_cache_backfill(
+    before: Pricing, after: Pricing, source: PricingSource | None
+) -> PricingSource | None:
+    """The provenance a price still deserves once a cache rate was backfilled.
+
+    ``pricing_source`` is one tag for a whole price, so the only claim it can
+    make honestly is the *least*-trusted source that contributed a rate to it.
+    When ``backfill_cache_pricing`` fills a cache rate from litellm's cost map,
+    the price stops being wholly whatever it was tagged: a price the provider
+    supplied natively, carrying a borrowed cache rate, is mixed-source and must
+    not go on claiming ``native``.
+
+    The correction is deliberately minimal and one-directional:
+
+    - It only moves *down* the trust order, never up. A backfill is not evidence
+      in a price's favour, so it can never promote ``unresolved`` or
+      ``openrouter``; a tag already at or below ``litellm`` is returned as-is.
+    - It only fires when the backfill actually changed a rate. A model litellm
+      cannot price leaves the provider's own claim untouched.
+    - ``manual`` therefore survives, which matters beyond tidiness: ``manual``
+      is the operator's own vouch, and it is what lets a deliberately free model
+      be enabled at all. Revoking it here would strip that vouch as a side
+      effect of a cache lookup.
+
+    Provenance per rate would be more truthful than one downgraded tag — a
+    native prompt price is not made less trustworthy by a borrowed cache rate —
+    but that is a schema change and belongs with the wider provenance work. The
+    guarantee kept here is the narrow one: the single tag never *overstates*.
+    """
+    if source is None:
+        # Nothing was claimed, so there is nothing to overstate.
+        return None
+    if all(
+        getattr(after, field) == getattr(before, field) for field in _CACHE_RATE_FIELDS
+    ):
+        return source
+    if _TRUST_RANK[source] >= _TRUST_RANK[PricingSource.LITELLM]:
+        return source
+    return PricingSource.LITELLM
+
+
 def _has_valid_pricing(model: dict) -> bool:
     """Check if model has valid pricing (usable rates, and not free)."""
     pricing = model.get("pricing", {})
@@ -376,7 +422,16 @@ def _row_to_model(
     # forwarded_model_id="deepseek-v4-flash") would otherwise look up the alias
     # and miss the cache rate.
     pricing_model_id = getattr(row, "forwarded_model_id", None) or row.id
+    pricing_before_backfill = parsed_pricing
     parsed_pricing = backfill_cache_pricing(pricing_model_id, parsed_pricing)
+
+    # A backfilled rate makes the stored price mixed-source, so the tag read
+    # back off the row can no longer be repeated verbatim.
+    resolved_source = source_after_cache_backfill(
+        pricing_before_backfill,
+        parsed_pricing,
+        _coerce_pricing_source(getattr(row, "pricing_source", None)),
+    )
 
     if apply_provider_fee:
         parsed_pricing = Pricing.parse_obj(
@@ -400,7 +455,7 @@ def _row_to_model(
         canonical_slug=getattr(row, "canonical_slug", None),
         alias_ids=json.loads(row.alias_ids) if row.alias_ids else None,
         forwarded_model_id=getattr(row, "forwarded_model_id", None),
-        pricing_source=_coerce_pricing_source(getattr(row, "pricing_source", None)),
+        pricing_source=resolved_source,
     )
 
     if apply_provider_fee:

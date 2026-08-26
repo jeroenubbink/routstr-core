@@ -235,7 +235,10 @@ async def test_numeric_string_price_is_still_accepted(
 ) -> None:
     """The stored pricing JSON has always accepted numeric strings, and the UI
     round-trips rates through text fields. Rejecting a *malformed* rate must not
-    also reject a well-formed one that arrives spelled as a string."""
+    also reject a well-formed one that arrives spelled as a string.
+
+    The write canonicalises the price before storing it, so what lands in the
+    row is the number the string denotes, not the string itself."""
     provider_id = await _make_provider(integration_session)
 
     resp = await integration_client.post(
@@ -249,7 +252,7 @@ async def test_numeric_string_price_is_still_accepted(
     assert resp.status_code == 200
     row = await integration_session.get(ModelRow, ("string-price", provider_id))
     assert row is not None
-    assert json.loads(row.pricing)["prompt"] == "0.000005"
+    assert json.loads(row.pricing)["prompt"] == pytest.approx(5e-06)
 
 
 def test_non_finite_price_is_rejected_by_the_write_model() -> None:

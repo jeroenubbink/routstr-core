@@ -1,6 +1,8 @@
 import asyncio
 import json
 import random
+from enum import StrEnum
+from typing import TypedDict
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -17,6 +19,68 @@ from .rates import BILLABLE_PRICING_FIELDS, coerce_rate, is_usable_rate
 logger = get_logger(__name__)
 
 models_router = APIRouter()
+
+
+class PricingSource(StrEnum):
+    """Where a model's advertised price came from, in decreasing trust order.
+
+    ``native`` is the provider's own API (the only fully trustworthy source);
+    ``litellm`` and ``openrouter`` are curated and resale estimates; ``manual``
+    is an operator-entered price; ``unresolved`` means no source could price the
+    model, so it was imported disabled rather than priced by invention.
+
+    Stored as plain text on ``ModelRow`` — an enum-annotated SQLModel field maps
+    to a ``VARCHAR`` with a ``CHECK`` constraint, so adding a source later would
+    need a schema migration for what is only ever read as a label.
+    """
+
+    NATIVE = "native"
+    LITELLM = "litellm"
+    OPENROUTER = "openrouter"
+    MANUAL = "manual"
+    UNRESOLVED = "unresolved"
+
+
+# ``PricingSource`` is declared in decreasing trust order, so a member's
+# position in the enum *is* its trust rank (lower index = more trusted).
+_TRUST_RANK = {source: rank for rank, source in enumerate(PricingSource)}
+
+
+class PricingProvenance(TypedDict):
+    """The provenance fields stamped onto a ``Model`` at resolve time."""
+
+    pricing_source: PricingSource
+
+
+def pricing_metadata(source: PricingSource | str) -> PricingProvenance:
+    """The provenance fields for a freshly resolved price.
+
+    Freshness anchoring — when the price was resolved, and the distribution
+    version of a static source — is deferred to the work that consumes it in a
+    freshness policy; this records only where the price came from.
+    """
+    return {"pricing_source": PricingSource(source)}
+
+
+def _coerce_pricing_source(value: object) -> "PricingSource | None":
+    """Coerce a stored pricing-source string to the enum, tolerating junk.
+
+    This runs on every database read via ``_row_to_model``. An unknown or empty
+    value must yield ``None`` rather than raise, or one malformed row would
+    blank the whole served catalog — the same failure class as a stored price
+    that will not parse.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return PricingSource(value)  # type: ignore[arg-type]
+    except ValueError:
+        logger.warning(
+            "Unknown pricing_source on model row; treating it as unrecorded",
+            extra={"pricing_source": repr(value)},
+        )
+        return None
+
 
 _MODEL_TEST_ENDPOINT_PATHS = {
     "chat-completions": "chat/completions",
@@ -101,6 +165,7 @@ class Model(BaseModel):
     canonical_slug: str | None = None
     alias_ids: list[str] | None = None
     forwarded_model_id: str | None = None
+    pricing_source: PricingSource | None = None
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -481,6 +546,7 @@ def _update_model_sats_pricing(model: Model, sats_to_usd: float) -> Model:
             canonical_slug=model.canonical_slug,
             alias_ids=model.alias_ids,
             forwarded_model_id=model.forwarded_model_id,
+            pricing_source=model.pricing_source,
         )
     except Exception as e:
         logger.error(

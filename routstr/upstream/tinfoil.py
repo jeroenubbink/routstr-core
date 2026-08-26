@@ -9,7 +9,8 @@ from pydantic.v1 import BaseModel
 
 from ..core.exceptions import UpstreamError
 from ..core.logging import get_logger
-from ..payment.models import Architecture, Model, Pricing
+from ..payment.models import Architecture, Model, Pricing, pricing_metadata
+from ..payment.rates import coerce_rate
 from .base import BaseUpstreamProvider
 from .ehbp import (
     _ENCLAVE_URL_HEADER,
@@ -18,6 +19,7 @@ from .ehbp import (
     ConfidentialInferenceProfile,
     EHBPForwardingTarget,
 )
+from .pricing_resolver import FallbackPricingResolver, ResolvedPricing
 
 if TYPE_CHECKING:
     from ..core.db import UpstreamProviderRow
@@ -164,11 +166,34 @@ class TinfoilUpstreamProvider(BaseUpstreamProvider):
             profile=self.confidential_inference_profile,
         )
 
+    @staticmethod
+    def _published_pricing(tf: TinfoilModel) -> tuple[float, float, float] | None:
+        """Tinfoil's own per-1M rates, or ``None`` when it published no price.
+
+        ``coerce_rate`` answers whether each value is a rate at all. What is
+        local to Tinfoil is the all-zero case: every rate on the pricing object
+        defaults to zero, so a model shipped without pricing is indistinguishable
+        from a free one and would be served billing every request nothing. Either
+        way the caller falls through to the shared chain rather than claiming a
+        price the provider did not give.
+        """
+        input_1m = coerce_rate(tf.pricing.inputTokenPricePer1M)
+        output_1m = coerce_rate(tf.pricing.outputTokenPricePer1M)
+        request_price = coerce_rate(tf.pricing.requestPrice)
+        if input_1m is None or output_1m is None or request_price is None:
+            return None
+        rates = (input_1m, output_1m, request_price)
+        if not any(rate > 0 for rate in rates):
+            return None
+        return rates
+
     async def fetch_models(self) -> list[Model]:
         """Fetch models from the public Tinfoil models endpoint.
 
         ``GET /v1/models`` is unauthenticated and returns all available models
-        with their pricing in USD per 1M tokens.
+        with their pricing in USD per 1M tokens. A model Tinfoil did not price
+        falls through to the shared chain and wears that source, or imports
+        disabled when nothing can price it.
         """
         url = f"{self.base_url}/v1/models"
         try:
@@ -179,12 +204,44 @@ class TinfoilUpstreamProvider(BaseUpstreamProvider):
                 models_data = data.get("data", [])
 
                 models: list[Model] = []
+                resolver = FallbackPricingResolver()
                 for model_data in models_data:
                     try:
                         tf = TinfoilModel.parse_obj(model_data)
-                        input_price = tf.pricing.inputTokenPricePer1M
-                        output_price = tf.pricing.outputTokenPricePer1M
-                        request_price = tf.pricing.requestPrice
+                        published = self._published_pricing(tf)
+                        enabled = True
+                        if published is not None:
+                            input_1m, output_1m, request_price = published
+                            prompt_price = input_1m / 1_000_000
+                            completion_price = output_1m / 1_000_000
+                            cache_read = cache_write = 0.0
+                            source = "native"
+                        else:
+                            resolved = await resolver.resolve(tf.id)
+                            if resolved is None:
+                                # Fail closed: never invent a price, and never
+                                # publish the zero defaults as a real one.
+                                logger.warning(
+                                    f"No pricing source resolved for Tinfoil model "
+                                    f"'{tf.id}'; importing it disabled",
+                                    extra={
+                                        "model_id": tf.id,
+                                        "base_url": self.base_url,
+                                    },
+                                )
+                                resolved = ResolvedPricing(
+                                    prompt=0.0,
+                                    completion=0.0,
+                                    context_length=None,
+                                    source="unresolved",
+                                )
+                                enabled = False
+                            prompt_price = resolved.prompt
+                            completion_price = resolved.completion
+                            request_price = 0.0
+                            cache_read = resolved.input_cache_read
+                            cache_write = resolved.input_cache_write
+                            source = resolved.source
 
                         modality = "text->text"
                         input_modalities = ["text"]
@@ -208,13 +265,17 @@ class TinfoilUpstreamProvider(BaseUpstreamProvider):
                                     instruct_type=None,
                                 ),
                                 pricing=Pricing(
-                                    prompt=input_price / 1_000_000,
-                                    completion=output_price / 1_000_000,
+                                    prompt=prompt_price,
+                                    completion=completion_price,
                                     request=request_price,
                                     image=0.0,
                                     web_search=0.0,
                                     internal_reasoning=0.0,
+                                    input_cache_read=cache_read,
+                                    input_cache_write=cache_write,
                                 ),
+                                enabled=enabled,
+                                **pricing_metadata(source),
                             )
                         )
                     except Exception as e:

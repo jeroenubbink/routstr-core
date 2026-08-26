@@ -741,6 +741,41 @@ def _resolve_provenance(
     return PricingSource.MANUAL.value
 
 
+def _enable_would_bill_nothing(
+    canonical: Pricing, requested_enabled: bool, source: str | None
+) -> bool:
+    """True if this write would leave a model serving requests for free.
+
+    The money-safety interlock. A model no source could price is imported at
+    zero and disabled; enabling it without pricing it first would advertise it
+    and bill every request nothing. Storing such a model is fine — an operator
+    has to be able to import it before pricing it — so only the *enable* is
+    refused, and only while nothing vouches for the price.
+
+    "Nothing vouches for it" is deliberately narrow: ``unresolved``, or a row
+    that predates provenance and so records no source at all. Note that
+    ``unresolved`` also covers "a source knows this model and says it is
+    genuinely free" — free is a real price, and pricing such a model at an
+    explicit zero (which makes the price the operator's own) is the intended way
+    to say so.
+    """
+    if not requested_enabled:
+        return False
+    if source not in (None, PricingSource.UNRESOLVED.value):
+        return False
+    return not has_chargeable_price(canonical)
+
+
+def _unpriced_enable_detail(model_ids: list[str]) -> str:
+    """The refusal an operator sees, including how to get past it."""
+    subject = ", ".join(sorted(model_ids))
+    return (
+        f"Cannot enable {subject}: no source has priced this model, so every "
+        "request would be billed nothing. Give it a price — or, if it really is "
+        'free, send pricing_source "manual" to record the price as your own.'
+    )
+
+
 def _normalize_forwarded_model_id(value: str | None) -> str | None:
     if value is None:
         return None
@@ -764,16 +799,22 @@ async def upsert_provider_model(
         # Try to get existing model
         existing_row = await session.get(ModelRow, (payload.id, provider_pk))
 
-        # One canonical price, compared and persisted identically.
+        # One canonical price, compared and persisted identically. The fee-free
+        # view is snapshotted before anything is mutated, so a price edit is
+        # detected against what the operator was actually shown.
         canonical = _canonical_pricing(payload)
+        existing_model = (
+            _existing_view_for_provenance(existing_row) if existing_row else None
+        )
+        source = _resolve_provenance(canonical, payload, existing_model)
+        if _enable_would_bill_nothing(canonical, payload.enabled, source):
+            raise HTTPException(
+                status_code=400, detail=_unpriced_enable_detail([payload.id])
+            )
 
         if existing_row:
             # Update existing model
             logger.info(f"Updating existing model: {payload.id}")
-            # Snapshot the fee-free view before mutating, so a price edit is
-            # detected against what the operator was actually shown.
-            existing_model = _existing_view_for_provenance(existing_row)
-            source = _resolve_provenance(canonical, payload, existing_model)
             existing_row.name = payload.name
             existing_row.description = payload.description
             existing_row.created = int(payload.created)
@@ -808,7 +849,6 @@ async def upsert_provider_model(
         else:
             # Create new model
             logger.info(f"Creating new model: {payload.id}")
-            source = _resolve_provenance(canonical, payload, None)
             row = ModelRow(
                 id=payload.id,
                 name=payload.name,
@@ -946,6 +986,7 @@ async def batch_override_provider_models(
         provider_pk = _provider_pk(provider)
 
         overridden_count = 0
+        refused: list[str] = []
 
         for model_data in payload.models:
             # Try to get existing model regardless of whether it's enabled or not
@@ -953,11 +994,18 @@ async def batch_override_provider_models(
 
             # One canonical price, compared and persisted identically.
             canonical = _canonical_pricing(model_data)
+            existing_model = (
+                _existing_view_for_provenance(existing_row) if existing_row else None
+            )
+            source = _resolve_provenance(canonical, model_data, existing_model)
+            if _enable_would_bill_nothing(canonical, model_data.enabled, source):
+                # Collect rather than raise here, so one refusal reports every
+                # offending model instead of only the first one reached.
+                refused.append(model_data.id)
+                continue
 
             if existing_row:
                 # Update existing
-                existing_model = _existing_view_for_provenance(existing_row)
-                source = _resolve_provenance(canonical, model_data, existing_model)
                 existing_row.name = model_data.name
                 existing_row.description = model_data.description
                 existing_row.created = int(model_data.created)
@@ -988,7 +1036,6 @@ async def batch_override_provider_models(
                 session.add(existing_row)
             else:
                 # Create new
-                source = _resolve_provenance(canonical, model_data, None)
                 row = ModelRow(
                     id=model_data.id,
                     name=model_data.name,
@@ -1024,6 +1071,14 @@ async def batch_override_provider_models(
                 session.add(row)
 
             overridden_count += 1
+
+        if refused:
+            # A batch override is one write. Refusing it whole leaves nothing
+            # for the operator to guess about: the session is never committed,
+            # so the rows already touched in this loop roll back with it.
+            raise HTTPException(
+                status_code=400, detail=_unpriced_enable_detail(refused)
+            )
 
         await session.commit()
 

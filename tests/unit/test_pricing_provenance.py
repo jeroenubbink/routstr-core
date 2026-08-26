@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from routstr.core.admin import has_chargeable_price
 from routstr.core.db import ModelRow
 from routstr.payment.models import (
     Architecture,
@@ -113,6 +114,25 @@ def _row(model_id: str, pricing: dict[str, object], source: str | None) -> Model
         upstream_provider_id=1,
         pricing_source=source,
     )
+
+
+# ---------------------------------------------------------------------------
+# what the write guard is willing to call a price
+# ---------------------------------------------------------------------------
+
+
+def test_one_malformed_rate_disqualifies_an_otherwise_chargeable_price() -> None:
+    """A positive rate must not vouch for a malformed one sitting beside it.
+
+    Upstream catalogs and direct database writers never pass the admin
+    validator, so the guard cannot assume the rates it is handed are
+    well-formed. Asking usability of *every* billable rate before asking
+    positivity of a collectible one is what makes that hold: ``any(rate > 0)``
+    on its own is satisfied by the good field and never looks at the bad one,
+    while a request can still bill on the bad one.
+    """
+    assert has_chargeable_price(Pricing(prompt=1e-06, completion=1e-06)) is True
+    assert has_chargeable_price(Pricing(prompt=-1.0, completion=1e-06)) is False
 
 
 # ---------------------------------------------------------------------------

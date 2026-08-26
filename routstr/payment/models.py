@@ -107,6 +107,7 @@ class Architecture(BaseModel):
     output_modalities: list[str]
     tokenizer: str
     instruct_type: str | None
+    supports_function_calling: bool | None = None
 
 
 class Pricing(BaseModel):

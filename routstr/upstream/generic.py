@@ -193,6 +193,7 @@ class GenericUpstreamProvider(BaseUpstreamProvider):
                                 output_modalities=resolved.output_modalities,
                                 tokenizer=resolved.tokenizer,
                                 instruct_type=resolved.instruct_type,
+                                supports_function_calling=resolved.supports_function_calling,
                             ),
                             pricing=Pricing(
                                 prompt=resolved.prompt,

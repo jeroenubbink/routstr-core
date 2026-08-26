@@ -669,3 +669,20 @@ async def test_a_malformed_tinfoil_rate_is_not_the_providers_price() -> None:
     model = _model_by_id(models, "deepseek-chat")
     assert model.pricing_source is PricingSource.LITELLM
     assert model.pricing.prompt > 0
+
+
+# ---------------------------------------------------------------------------
+# a capability the cost map carries and nothing had a home for
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_function_calling_support_is_carried_from_the_cost_map() -> None:
+    """litellm records whether a model supports function calling. It had no
+    typed field, so it was read and thrown away on every resolve."""
+    payload = {"data": [{"id": "deepseek-chat", "owned_by": "deepseek"}]}
+
+    models = await _fetch_generic(payload, [])
+
+    model = _model_by_id(models, "deepseek-chat")
+    assert model.architecture.supports_function_calling is True

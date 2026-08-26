@@ -357,6 +357,7 @@ def _row_to_model(
         canonical_slug=getattr(row, "canonical_slug", None),
         alias_ids=json.loads(row.alias_ids) if row.alias_ids else None,
         forwarded_model_id=getattr(row, "forwarded_model_id", None),
+        pricing_source=_coerce_pricing_source(getattr(row, "pricing_source", None)),
     )
 
     if apply_provider_fee:

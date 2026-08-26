@@ -10,12 +10,16 @@ and sats carrier rebuilds a catalog refresh performs.
 
 from __future__ import annotations
 
+import json
+
+from routstr.core.db import ModelRow
 from routstr.payment.models import (
     Architecture,
     Model,
     Pricing,
     PricingSource,
     TopProvider,
+    _row_to_model,
     _update_model_sats_pricing,
     pricing_metadata,
 )
@@ -45,6 +49,21 @@ def _model_with_source(
     )
 
 
+def _row(model_id: str, pricing: dict[str, object], source: str | None) -> ModelRow:
+    return ModelRow(
+        id=model_id,
+        name=model_id,
+        created=0,
+        description="",
+        context_length=128000,
+        architecture=json.dumps(_ARCHITECTURE),
+        pricing=json.dumps(pricing),
+        enabled=True,
+        upstream_provider_id=1,
+        pricing_source=source,
+    )
+
+
 # ---------------------------------------------------------------------------
 # the tag survives the carrier rebuilds
 # ---------------------------------------------------------------------------
@@ -59,3 +78,33 @@ def test_sats_pricing_rebuild_preserves_provenance() -> None:
 
     assert rebuilt.sats_pricing is not None
     assert rebuilt.pricing_source == PricingSource.LITELLM
+
+
+# ---------------------------------------------------------------------------
+# reading the tag back off a stored row
+# ---------------------------------------------------------------------------
+
+
+def test_stored_source_is_read_back_as_the_enum() -> None:
+    model = _row_to_model(
+        _row("m1", {"prompt": 1e-06, "completion": 2e-06}, "openrouter")
+    )
+
+    assert model.pricing_source is PricingSource.OPENROUTER
+
+
+def test_unknown_stored_source_reads_as_unrecorded_instead_of_raising() -> None:
+    """The read path runs on every catalog build. A value that is not a source —
+    a foreign writer, a typo, a downgrade from a version that knew more — must
+    not raise, or one row would blank the whole served catalog."""
+    model = _row_to_model(
+        _row("m1", {"prompt": 1e-06, "completion": 2e-06}, "wishful-thinking")
+    )
+
+    assert model.pricing_source is None
+
+
+def test_a_row_written_before_provenance_reads_as_unrecorded() -> None:
+    model = _row_to_model(_row("m1", {"prompt": 1e-06, "completion": 2e-06}, None))
+
+    assert model.pricing_source is None

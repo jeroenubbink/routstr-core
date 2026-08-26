@@ -526,3 +526,281 @@ async def test_one_unreadable_price_does_not_abort_a_whole_batch(
     assert row.enabled is True
     sibling = await integration_session.get(ModelRow, ("healthy-sibling", provider_id))
     assert sibling is not None
+
+
+# ---------------------------------------------------------------------------
+# the zero-price interlock, and where it does not run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_enabling_a_model_no_source_priced_is_refused(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """A model nothing could price is imported at zero and disabled. Enabling it
+    without pricing it first would serve it and bill every request nothing."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id,
+            model_id="unpriced",
+            prompt=0.0,
+            completion=0.0,
+            pricing_source="unresolved",
+            enabled=True,
+        ),
+    )
+
+    assert resp.status_code == 400
+    assert "unpriced" in resp.json()["detail"]
+    assert await integration_session.get(ModelRow, ("unpriced", provider_id)) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_creating_an_enabled_free_model_without_a_source_is_refused(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """A client that sends no provenance cannot tell a deliberate free import
+    from an unpriced one, so a zero price arrives as ``unresolved`` and the same
+    refusal applies."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id, model_id="free-untagged", prompt=0.0, completion=0.0
+        ),
+    )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_model_no_source_priced_may_still_be_stored_disabled(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """The check is about serving, not about storing. An unpriced model still
+    has to be importable so an operator can find it and price it."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id,
+            model_id="parked",
+            prompt=0.0,
+            completion=0.0,
+            enabled=False,
+        ),
+    )
+
+    assert resp.status_code == 200
+    row = await integration_session.get(ModelRow, ("parked", provider_id))
+    assert row is not None
+    assert row.pricing_source == "unresolved"
+    assert row.enabled is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_pricing_an_unpriced_model_is_what_lets_it_be_enabled(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """The refusal names a way out, and this is it: give the model a price. That
+    makes the price the operator's own, which satisfies the check."""
+    provider_id = await _make_provider(integration_session)
+    integration_session.add(
+        _seed_row(
+            provider_id,
+            model_id="price-me",
+            pricing={"prompt": 0.0, "completion": 0.0},
+            pricing_source="unresolved",
+            enabled=False,
+        )
+    )
+    await integration_session.commit()
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(provider_id, model_id="price-me", enabled=True),
+    )
+
+    assert resp.status_code == 200
+    integration_session.expire_all()
+    row = await integration_session.get(ModelRow, ("price-me", provider_id))
+    assert row is not None
+    assert row.pricing_source == "manual"
+    assert row.enabled is True
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_operator_may_vouch_for_a_model_that_is_genuinely_free(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """Free is a real price. An operator who declares the price their own is
+    making a deliberate statement, and the check defers to it."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id,
+            model_id="really-free",
+            prompt=0.0,
+            completion=0.0,
+            pricing_source="manual",
+            enabled=True,
+        ),
+    )
+
+    assert resp.status_code == 200
+    row = await integration_session.get(ModelRow, ("really-free", provider_id))
+    assert row is not None
+    assert row.enabled is True
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_operator_zeroing_a_price_owns_that_choice(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """Editing a price down to zero is a price edit, so the price becomes the
+    operator's own and the model stays enabled."""
+    provider_id = await _make_provider(integration_session)
+    integration_session.add(
+        _seed_row(
+            provider_id,
+            model_id="zero-me",
+            pricing={"prompt": 1e-7, "completion": 2e-7},
+            pricing_source="openrouter",
+        )
+    )
+    await integration_session.commit()
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id,
+            model_id="zero-me",
+            prompt=0.0,
+            completion=0.0,
+            enabled=True,
+        ),
+    )
+
+    assert resp.status_code == 200
+    integration_session.expire_all()
+    row = await integration_session.get(ModelRow, ("zero-me", provider_id))
+    assert row is not None
+    assert row.pricing_source == "manual"
+    assert row.enabled is True
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_price_only_a_request_rate_can_bill_does_not_count_as_priced(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """The reservation is derived from the token rates alone, so a model priced
+    purely per request is advertised, reserves the floor and settles there. The
+    check must not vouch for a collection the node cannot make."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/models",
+        headers=_admin_headers(),
+        json=_payload(
+            provider_id,
+            model_id="request-only",
+            pricing={"prompt": 0.0, "completion": 0.0, "request": 0.5},
+            pricing_source="unresolved",
+            enabled=True,
+        ),
+    )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_batch_naming_unpriced_models_is_refused_whole(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """The batch write is one write. Refusing it whole — naming every offending
+    model — is what keeps an operator from having to guess which half landed."""
+    provider_id = await _make_provider(integration_session)
+
+    resp = await integration_client.post(
+        f"/admin/api/upstream-providers/{provider_id}/batch-override",
+        headers=_admin_headers(),
+        json={
+            "models": [
+                _payload(provider_id, model_id="batch-priced"),
+                _payload(
+                    provider_id,
+                    model_id="batch-unpriced-a",
+                    prompt=0.0,
+                    completion=0.0,
+                    pricing_source="unresolved",
+                ),
+                _payload(
+                    provider_id,
+                    model_id="batch-unpriced-b",
+                    prompt=0.0,
+                    completion=0.0,
+                    pricing_source="unresolved",
+                ),
+            ]
+        },
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "batch-unpriced-a" in detail
+    assert "batch-unpriced-b" in detail
+    integration_session.expire_all()
+    for model_id in ("batch-priced", "batch-unpriced-a", "batch-unpriced-b"):
+        assert await integration_session.get(ModelRow, (model_id, provider_id)) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_stored_unpriced_row_that_is_enabled_is_still_served(
+    integration_client: AsyncClient, integration_session: AsyncSession
+) -> None:
+    """The check runs at the write edge and nowhere else.
+
+    Rows that were already enabled and priced at nothing keep being served until
+    an operator touches them. That is the accepted cost of keeping the question
+    "is this a price?" at the one place it can be answered without asking the
+    much larger question of whether a request in flight can be collected on.
+    """
+    provider_id = await _make_provider(integration_session)
+    integration_session.add(
+        _seed_row(
+            provider_id,
+            model_id="legacy-free",
+            pricing={"prompt": 0.0, "completion": 0.0},
+            pricing_source="unresolved",
+            enabled=True,
+        )
+    )
+    await integration_session.commit()
+
+    from routstr.payment.models import list_models
+
+    served = {m.id for m in await list_models(integration_session, provider_id)}
+
+    assert served == {"legacy-free"}
